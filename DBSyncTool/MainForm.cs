@@ -2,6 +2,7 @@
 using DBSyncTool.Models;
 using DBSyncTool.Services;
 using System.ComponentModel;
+using System.Reflection;
 
 namespace DBSyncTool
 {
@@ -11,6 +12,11 @@ namespace DBSyncTool
         private ConfigManager _configManager;
         private CopyOrchestrator? _orchestrator;
         private BindingList<TableInfo> _tablesBindingList;
+
+        // Full, unfiltered set of tables from the last grid update — the search box filters
+        // a subset of these into _tablesBindingList without needing new data from the orchestrator.
+        private List<TableInfo> _allTables = new();
+        private PropertyInfo[] _searchableProperties = Array.Empty<PropertyInfo>();
         private bool _isExecuting = false;
         private bool _isUpdatingComboBox = false;
         private bool _timestampsUpdatedDuringExecution = false;
@@ -52,6 +58,7 @@ namespace DBSyncTool
 
             // Clear binding list to release table references
             _tablesBindingList.Clear();
+            _allTables.Clear();
 
             // Stop and dispose update timer
             _updateTimer.Stop();
@@ -290,6 +297,16 @@ namespace DBSyncTool
                 AutoSizeMode = DataGridViewAutoSizeColumnMode.None,
                 SortMode = DataGridViewColumnSortMode.Automatic
             });
+
+            // Cache the TableInfo properties backing each column once, so the search box can
+            // scan every column's value without re-resolving property names on every keystroke.
+            _searchableProperties = dgvTables.Columns.Cast<DataGridViewColumn>()
+                .Select(c => typeof(TableInfo).GetProperty(c.DataPropertyName))
+                .Where(p => p != null)
+                .Cast<PropertyInfo>()
+                .ToArray();
+
+            txtSearch.TextChanged += TxtSearch_TextChanged;
         }
 
         private void LoadInitialConfiguration()
@@ -343,6 +360,7 @@ namespace DBSyncTool
             txtFieldsToExclude.Text = _currentConfig.FieldsToExclude;
             nudDefaultRecordCount.Value = _currentConfig.DefaultRecordCount;
             chkTruncateAll.Checked = _currentConfig.TruncateAllTables;
+            chkSyncUatSchema.Checked = _currentConfig.SyncUatSchema;
             chkExecutePostTransferActions.Checked = _currentConfig.ExecutePostTransferActions;
             txtStrategyOverrides.Text = _currentConfig.StrategyOverrides;
 
@@ -428,6 +446,7 @@ namespace DBSyncTool
             _currentConfig.FieldsToExclude = txtFieldsToExclude.Text;
             _currentConfig.DefaultRecordCount = (int)nudDefaultRecordCount.Value;
             _currentConfig.TruncateAllTables = chkTruncateAll.Checked;
+            _currentConfig.SyncUatSchema = chkSyncUatSchema.Checked;
             _currentConfig.ExecutePostTransferActions = chkExecutePostTransferActions.Checked;
             _currentConfig.StrategyOverrides = txtStrategyOverrides.Text;
 
@@ -704,39 +723,86 @@ namespace DBSyncTool
             // on the existing TableInfo objects were mutated. Repaint in place instead of
             // rebuilding the binding list, so the user's selection, scroll position and sort are
             // preserved and the grid stays navigable. Rebuilding would reset all of those every tick.
-            if (_tablesBindingList.Count == tables.Count &&
-                new HashSet<TableInfo>(_tablesBindingList).SetEquals(tables))
+            if (_allTables.Count == tables.Count && new HashSet<TableInfo>(_allTables).SetEquals(tables))
             {
+                _allTables = tables;
                 dgvTables.Invalidate();
                 UpdateSummary(tables);
                 return;
             }
 
-            // Save current selection and scroll position
-            int selectedRowIndex = dgvTables.SelectedRows.Count > 0
-                ? dgvTables.SelectedRows[0].Index
-                : -1;
-            int firstDisplayedScrollingRowIndex = dgvTables.FirstDisplayedScrollingRowIndex;
+            _allTables = tables;
+            ApplyTableFilter(preserveSelectionAndScroll: true);
+            UpdateSummary(tables);
+        }
+
+        /// <summary>
+        /// Rebuilds _tablesBindingList (what the grid actually shows) from _allTables, applying
+        /// the search box's filter. Called whenever the underlying table set changes and whenever
+        /// the search text changes.
+        /// </summary>
+        private void ApplyTableFilter(bool preserveSelectionAndScroll)
+        {
+            var filtered = FilterTables(_allTables, txtSearch.Text);
+
+            int selectedRowIndex = -1;
+            int firstDisplayedScrollingRowIndex = -1;
+            if (preserveSelectionAndScroll)
+            {
+                selectedRowIndex = dgvTables.SelectedRows.Count > 0 ? dgvTables.SelectedRows[0].Index : -1;
+                firstDisplayedScrollingRowIndex = dgvTables.FirstDisplayedScrollingRowIndex;
+            }
 
             _tablesBindingList.Clear();
-            foreach (var table in tables)
+            foreach (var table in filtered)
             {
                 _tablesBindingList.Add(table);
             }
 
-            // Restore selection and scroll position
-            if (selectedRowIndex >= 0 && selectedRowIndex < dgvTables.Rows.Count)
+            if (preserveSelectionAndScroll)
             {
-                dgvTables.ClearSelection();
-                dgvTables.Rows[selectedRowIndex].Selected = true;
-            }
+                if (selectedRowIndex >= 0 && selectedRowIndex < dgvTables.Rows.Count)
+                {
+                    dgvTables.ClearSelection();
+                    dgvTables.Rows[selectedRowIndex].Selected = true;
+                }
 
-            if (firstDisplayedScrollingRowIndex >= 0 && firstDisplayedScrollingRowIndex < dgvTables.Rows.Count)
+                if (firstDisplayedScrollingRowIndex >= 0 && firstDisplayedScrollingRowIndex < dgvTables.Rows.Count)
+                {
+                    dgvTables.FirstDisplayedScrollingRowIndex = firstDisplayedScrollingRowIndex;
+                }
+            }
+        }
+
+        private List<TableInfo> FilterTables(List<TableInfo> tables, string? searchText)
+        {
+            if (string.IsNullOrWhiteSpace(searchText))
+                return tables;
+
+            string term = searchText.Trim();
+            return tables.Where(t => MatchesSearch(t, term)).ToList();
+        }
+
+        /// <summary>
+        /// True if any column value shown in the grid contains the search term (case-insensitive).
+        /// Scans the same properties backing dgvTables' columns, so it covers table name, status,
+        /// strategy, error text, row counts, etc. without needing a hand-maintained field list.
+        /// </summary>
+        private bool MatchesSearch(TableInfo table, string term)
+        {
+            foreach (var prop in _searchableProperties)
             {
-                dgvTables.FirstDisplayedScrollingRowIndex = firstDisplayedScrollingRowIndex;
+                string? value = prop.GetValue(table)?.ToString();
+                if (!string.IsNullOrEmpty(value) && value.Contains(term, StringComparison.OrdinalIgnoreCase))
+                    return true;
             }
+            return false;
+        }
 
-            UpdateSummary(tables);
+        private void TxtSearch_TextChanged(object? sender, EventArgs e)
+        {
+            ApplyTableFilter(preserveSelectionAndScroll: true);
+            UpdateSummary(_allTables);
         }
 
         private void UpdateSummary(List<TableInfo> tables)
@@ -746,7 +812,10 @@ namespace DBSyncTool
 
             if (tables.Count > 0)
             {
-                lblSummary.Text = $"Loaded {tables.Count} tables, {completed} inserted, {failed} failed";
+                string filterSuffix = _tablesBindingList.Count != tables.Count
+                    ? $" (showing {_tablesBindingList.Count} matching filter)"
+                    : "";
+                lblSummary.Text = $"Loaded {tables.Count} tables, {completed} inserted, {failed} failed{filterSuffix}";
             }
             else
             {

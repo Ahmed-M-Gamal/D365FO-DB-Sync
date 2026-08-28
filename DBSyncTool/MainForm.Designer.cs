@@ -78,6 +78,7 @@ namespace DBSyncTool
             nudDefaultRecordCount = new NumericUpDown();
             chkTruncateAll = new CheckBox();
             chkExecutePostTransferActions = new CheckBox();
+            chkSyncUatSchema = new CheckBox();
             lblFieldsToExclude = new Label();
             txtFieldsToExclude = new TextBox();
 
@@ -166,6 +167,9 @@ namespace DBSyncTool
 
             // Status
             lblStatus = new Label();
+
+            // Grid search box
+            txtSearch = new TextBox();
 
             // Data grid
             dgvTables = new DataGridView();
@@ -315,6 +319,7 @@ namespace DBSyncTool
             tabTables.Controls.Add(btnStop);
             tabTables.Controls.Add(btnCopyToClipboard);
             tabTables.Controls.Add(lblStatus);
+            tabTables.Controls.Add(txtSearch);
             tabTables.Controls.Add(dgvTables);
             tabTables.Controls.Add(lblSummary);
             tabTables.Controls.Add(grpLog);
@@ -432,9 +437,10 @@ namespace DBSyncTool
             grpCol4.Controls.Add(nudDefaultRecordCount);
             grpCol4.Controls.Add(chkTruncateAll);
             grpCol4.Controls.Add(chkExecutePostTransferActions);
+            grpCol4.Controls.Add(chkSyncUatSchema);
             grpCol4.Location = new Point(1045, 10);
             grpCol4.Name = "grpCol4";
-            grpCol4.Size = new Size(335, 125);
+            grpCol4.Size = new Size(335, 150);
             grpCol4.Text = "Other Settings";
 
             lblDefaultRecordCount.AutoSize = true;
@@ -463,6 +469,14 @@ namespace DBSyncTool
             chkExecutePostTransferActions.Checked = false;
             ToolTip postTransferActionsTooltip = new ToolTip();
             postTransferActionsTooltip.SetToolTip(chkExecutePostTransferActions, "When checked, executes post-transfer actions (SQL scripts, backup, PowerShell script) after successful table processing");
+
+            chkSyncUatSchema.AutoSize = true;
+            chkSyncUatSchema.Location = new Point(10, 105);
+            chkSyncUatSchema.Name = "chkSyncUatSchema";
+            chkSyncUatSchema.Text = "Sync UAT Schema (add missing columns from Tier2)";
+            chkSyncUatSchema.Checked = false;
+            ToolTip syncUatSchemaTooltip = new ToolTip();
+            syncUatSchemaTooltip.SetToolTip(chkSyncUatSchema, "When checked, adds any column that exists in Tier2 but not in AxDB before copying (same SQL type, always nullable). Physical column only — does not update AxDB's SQLDICTIONARY, so D365/X++ won't recognize the field until you add it to your model and run a real Database Sync. Applies to normal tables and System tables.");
 
             lblFieldsToExclude.AutoSize = true;
             lblFieldsToExclude.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
@@ -1117,6 +1131,13 @@ namespace DBSyncTool
             lblStatus.Text = "Ready";
             lblStatus.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
 
+            // Grid search box (in Tables tab) — filters the grid by any visible column
+            txtSearch.Location = new Point(1060, 257);
+            txtSearch.Name = "txtSearch";
+            txtSearch.Size = new Size(312, 23);
+            txtSearch.PlaceholderText = "Search (table, status, error, ...)";
+            txtSearch.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+
             // Data Grid (in Tables tab)
             dgvTables.AllowUserToAddRows = false;
             dgvTables.AllowUserToDeleteRows = false;
@@ -1279,6 +1300,7 @@ namespace DBSyncTool
         private NumericUpDown nudDefaultRecordCount;
         private CheckBox chkTruncateAll;
         private CheckBox chkExecutePostTransferActions;
+        private CheckBox chkSyncUatSchema;
         private Label lblFieldsToExclude;
         private TextBox txtFieldsToExclude;
 
@@ -1369,6 +1391,7 @@ namespace DBSyncTool
 
         // Status and Grid
         private Label lblStatus;
+        private TextBox txtSearch;
         private DataGridView dgvTables;
         private Label lblSummary;
 

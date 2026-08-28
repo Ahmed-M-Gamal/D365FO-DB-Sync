@@ -295,6 +295,18 @@ D365FO has metadata/security tables that are NOT registered in SQLDICTIONARY and
 - **Est Size(MB)** = full table size (`SizeGB × 1024`), since the entire table is copied.
 - **Processing** (`CopyOrchestrator.ProcessTableSystemModeAsync` → `AxDbDataService.InsertSystemTableDataAsync`): fetch full table → disable triggers → `TRUNCATE` (falls back to `DELETE` if FK/view-referenced) → `SqlBulkCopy` all columns → re-enable triggers. **No** delta comparison, RecId/sequence update, or timestamp persistence. Existing copy strategies are ignored for these tables.
 
+### Sync UAT Schema
+
+By default, `copyableFields` for a normal table is the **intersection** of Tier2 and AxDB field lists (`CopyOrchestrator.cs` — `tier2Fields.Intersect(axDbFields, ...)`), so a column that exists in Tier2 but not in AxDB is silently dropped from the fetch — no error, no log. The **System** tab tables are stricter: `BuildSystemTableInfo` requires an identical column set and fails the table with `FetchError`/"Schema mismatch" if Tier2 has an extra column (see [System Tables Copy](#system-tables-copy) above).
+
+The **Sync UAT Schema** checkbox (Connection tab, "Other Settings" group) closes this gap for both paths: during **Discover Tables**, before field lists are compared, it adds any column present in Tier2 but missing in AxDB.
+
+- **Configuration**: `AppConfiguration.SyncUatSchema` (default off).
+- **Scope**: runs for both normal (SQLDICTIONARY-driven) tables and System tables — one checkbox fixes the same underlying problem in both discovery paths.
+- **Column added as**: same SQL data type/length/precision/scale/collation as Tier2 (read from Tier2's `INFORMATION_SCHEMA.COLUMNS` via `Tier2DataService.GetColumnDefinitionsAsync` → `Models/ColumnDefinition.SqlTypeString`), but always **nullable** — regardless of Tier2's own nullability — since existing AxDB rows have no value to backfill.
+- **Physical-only**: this issues a plain `ALTER TABLE ... ADD ...` against AxDB (`AxDbDataService.AddMissingColumnsAsync`). It does **not** insert a row into AxDB's own `SQLDICTIONARY` table — that's D365 metadata, only populated by a real Database Sync (SyncEngine), which per this repo's global tooling rules is never triggered automatically. Practically: the column gets data and is picked up by this tool's own comparisons, but X++/the D365 client won't recognize it as a field until it's also added to the local model and a real Database Sync is run.
+- **Implementation** (`CopyOrchestrator.SyncMissingColumnsAsync`): diffs the two field-name sets, batch-fetches Tier2 column definitions only for what's missing, and calls `AxDbDataService.AddMissingColumnsAsync` per table (validates identifiers against `^[A-Za-z0-9_]+$` before building DDL). For normal tables, discovery is split into two passes over the same qualifying-table list purely so `SyncMissingColumnsAsync` can run once, batched, between them — pass 1 resolves SQLDICTIONARY caches and filters, pass 2 builds `TableInfo` using the (possibly extended) AxDB field list. For System tables, it reuses the already-fetched `tier2ColsMap`/`axDbColsMap`, then re-fetches `axDbColsMap` (a live query) if anything was added, so `BuildSystemTableInfo`'s existing identical-schema check sees the new columns.
+
 ### SQLDICTIONARY Caching
 
 Critical optimization in `Models/SqlDictionaryCache.cs`:
@@ -360,8 +372,9 @@ Critical optimization in `Models/SqlDictionaryCache.cs`:
 **Sequence Management**
 - After bulk insert, sequences must be updated to max(RecId)+1
 - Prevents RecId conflicts on next insert
-- Sequence name format: `SEQ_{TableID}` (e.g., SEQ_10878)
-- Only updated if max RecId is higher than current sequence value
+- Sequence name format: `SEQ_{TableID}` (e.g., SEQ_10878), using the AxDB TableId
+- `UpdateSequenceAsync` (`AxDbDataService.cs` and `CopyOrchestrator.cs` — two near-identical copies, one per code path) always restarts the sequence to `MAX(MaxRecId, CurrentSeq) + SEQUENCE_GAP`, not only when MaxRecId is higher
+- If `SEQ_{TableId}` doesn't exist at all in AxDB (e.g. a Database Sync never ran/completed for that table locally), it is **created** — `CREATE SEQUENCE [SEQ_{TableId}] AS BIGINT START WITH <MaxRecId + SEQUENCE_GAP> INCREMENT BY 1 MINVALUE 1 NO CACHE` — instead of being silently skipped. A skipped/missing sequence only used to surface later as an insert failure in the D365 client, not as a copy error
 
 **D365 Table Naming Convention**
 - Only tables with ALL UPPERCASE letters, numbers, and underscores are considered D365 tables

@@ -203,6 +203,72 @@ namespace DBSyncTool.Services
         }
 
         /// <summary>
+        /// Gets full column definitions (data type, length, precision, scale, collation) for
+        /// many tables in one query from INFORMATION_SCHEMA.COLUMNS. Used by Sync UAT Schema to
+        /// replicate columns that exist in Tier2 but are missing in AxDB.
+        /// </summary>
+        public async Task<Dictionary<string, List<ColumnDefinition>>> GetColumnDefinitionsAsync(IEnumerable<string> tableNames)
+        {
+            return await GetColumnDefinitionsAsync(_connectionString, _connectionSettings.CommandTimeout, tableNames);
+        }
+
+        /// <summary>
+        /// Shared INFORMATION_SCHEMA column-definition lookup usable against any connection string.
+        /// </summary>
+        internal static async Task<Dictionary<string, List<ColumnDefinition>>> GetColumnDefinitionsAsync(
+            string connectionString, int commandTimeout, IEnumerable<string> tableNames)
+        {
+            var result = new Dictionary<string, List<ColumnDefinition>>(StringComparer.OrdinalIgnoreCase);
+            var names = tableNames.Select(n => n.ToUpper()).Distinct().ToList();
+            if (names.Count == 0)
+                return result;
+
+            using var connection = new SqlConnection(connectionString);
+            using var command = new SqlCommand(string.Empty, connection);
+            string inClause = BuildInClause(command, names);
+
+            command.CommandText = $@"
+                SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, c.CHARACTER_MAXIMUM_LENGTH,
+                       c.NUMERIC_PRECISION, c.NUMERIC_SCALE, c.DATETIME_PRECISION, c.COLLATION_NAME
+                FROM INFORMATION_SCHEMA.COLUMNS c
+                INNER JOIN INFORMATION_SCHEMA.TABLES t
+                    ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
+                   AND t.TABLE_NAME = c.TABLE_NAME
+                WHERE c.TABLE_SCHEMA = 'dbo'
+                  AND t.TABLE_TYPE = 'BASE TABLE'
+                  AND UPPER(c.TABLE_NAME) IN ({inClause})
+                ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION";
+            command.CommandTimeout = commandTimeout;
+
+            await connection.OpenAsync();
+            using var reader = await command.ExecuteReaderAsync();
+
+            while (await reader.ReadAsync())
+            {
+                string table = reader.GetString(0).ToUpper();
+                var def = new ColumnDefinition
+                {
+                    ColumnName = reader.GetString(1),
+                    DataType = reader.GetString(2),
+                    MaxLength = reader.IsDBNull(3) ? null : reader.GetInt32(3),
+                    Precision = reader.IsDBNull(4) ? null : (int)reader.GetByte(4),
+                    Scale = reader.IsDBNull(5) ? null : (int)reader.GetInt32(5),
+                    DateTimePrecision = reader.IsDBNull(6) ? null : (int)reader.GetInt16(6),
+                    Collation = reader.IsDBNull(7) ? null : reader.GetString(7)
+                };
+
+                if (!result.TryGetValue(table, out var list))
+                {
+                    list = new List<ColumnDefinition>();
+                    result[table] = list;
+                }
+                list.Add(def);
+            }
+
+            return result;
+        }
+
+        /// <summary>
         /// Adds an @p0,@p1,... parameter set for an IN clause and returns the placeholder list.
         /// </summary>
         private static string BuildInClause(SqlCommand command, List<string> values)

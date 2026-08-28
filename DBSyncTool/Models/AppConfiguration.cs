@@ -41,6 +41,12 @@ namespace DBSyncTool.Models
         // Force truncate mode for all tables
         public bool TruncateAllTables { get; set; } = false;
 
+        // When enabled, before comparing schemas, adds any column present in Tier2 but missing in
+        // AxDB (matching Tier2's SQL type, always nullable). Physical-only — does not update AxDB's
+        // SQLDICTIONARY, so D365/X++ will not recognize the field until the model is updated and a
+        // real Database Sync is run. Applies to both normal and System tables.
+        public bool SyncUatSchema { get; set; } = false;
+
         // New timestamp storage for SysRowVersion optimization
         public string Tier2Timestamps { get; set; } = "";  // Multiline: TableName,0xTimestamp
         public string AxDBTimestamps { get; set; } = "";   // Multiline: TableName,0xTimestamp

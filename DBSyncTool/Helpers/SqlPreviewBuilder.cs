@@ -140,7 +140,9 @@ namespace DBSyncTool.Helpers
             sql.AppendLine(stepTitle);
             sql.AppendLine($"SELECT MAX(RecId) FROM [{table.TableName}]   -- @MaxRecId; NULL (empty table) → nothing below runs");
             sql.AppendLine($"SELECT CAST(current_value AS BIGINT) FROM sys.sequences WHERE name = 'SEQ_{table.AxDbTableId}'");
-            sql.AppendLine("-- @CurrentSeq; sequence not found → nothing below runs");
+            sql.AppendLine("-- @CurrentSeq; sequence not found (Database Sync never created it) →");
+            sql.AppendLine($"CREATE SEQUENCE [SEQ_{table.AxDbTableId}] AS BIGINT START WITH <@MaxRecId + {AxDbDataService.SEQUENCE_GAP}> INCREMENT BY 1 MINVALUE 1 NO CACHE   -- only when missing");
+            sql.AppendLine("-- otherwise:");
             sql.AppendLine($"ALTER SEQUENCE [SEQ_{table.AxDbTableId}] RESTART WITH <MAX(@MaxRecId, @CurrentSeq) + {AxDbDataService.SEQUENCE_GAP}>");
             sql.AppendLine("-- Always restarted (not only when MaxRecId is higher); the gap avoids RecId conflicts");
         }

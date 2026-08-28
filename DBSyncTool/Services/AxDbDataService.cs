@@ -108,6 +108,49 @@ namespace DBSyncTool.Services
             return await Tier2DataService.GetTablesColumnsAsync(_connectionString, _connectionSettings.CommandTimeout, tableNames);
         }
 
+        private static readonly System.Text.RegularExpressions.Regex ValidIdentifier =
+            new(@"^[A-Za-z0-9_]+$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>
+        /// Adds one or more columns to an AxDB table that exist in Tier2 but not locally (Sync
+        /// UAT Schema). Columns are always added nullable, using the same SQL type/length/
+        /// precision/scale/collation as Tier2, since existing rows have no value to backfill.
+        /// Physical-only — does not touch AxDB's SQLDICTIONARY. Table/column names are validated
+        /// against the D365 identifier convention before being interpolated into DDL.
+        /// </summary>
+        public async Task<int> AddMissingColumnsAsync(string tableName, List<ColumnDefinition> columns, CancellationToken cancellationToken)
+        {
+            if (!ValidIdentifier.IsMatch(tableName))
+            {
+                _logger($"[SchemaSync] {tableName}: skipped — table name failed identifier validation");
+                return 0;
+            }
+
+            var validColumns = columns.Where(c => ValidIdentifier.IsMatch(c.ColumnName)).ToList();
+            var invalidColumns = columns.Except(validColumns).ToList();
+            foreach (var invalid in invalidColumns)
+                _logger($"[SchemaSync] {tableName}: skipped column [{invalid.ColumnName}] — failed identifier validation");
+
+            if (validColumns.Count == 0)
+                return 0;
+
+            string columnClauses = string.Join(", ", validColumns.Select(c => $"[{c.ColumnName}] {c.SqlTypeString} NULL"));
+            string alterSql = $"ALTER TABLE [{tableName}] ADD {columnClauses}";
+            _logger($"[AxDB SQL] {alterSql}");
+
+            using var connection = new SqlConnection(_connectionString);
+            using var command = new SqlCommand(alterSql, connection);
+            command.CommandTimeout = _connectionSettings.CommandTimeout;
+
+            using (cancellationToken.Register(() => { try { command.Cancel(); } catch { /* best-effort */ } }))
+            {
+                await connection.OpenAsync(cancellationToken);
+                await command.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            return validColumns.Count;
+        }
+
         /// <summary>
         /// Inserts data for a System table: TRUNCATE (with DELETE fallback) then bulk insert
         /// all rows. No delta comparison, no RecId/sequence handling, no timestamps.
@@ -513,7 +556,17 @@ namespace DBSyncTool.Services
 
             if (currentSeqResult == null || currentSeqResult == DBNull.Value)
             {
-                _logger($"[AxDB] {tableInfo.TableName}: Sequence {sequenceName} not found in sys.sequences (AxDbTableId={tableInfo.AxDbTableId}), skipping sequence update");
+                // Sequence missing entirely (e.g. Database Sync never ran/completed for this table
+                // locally) — create it rather than silently leaving the table without one, since a
+                // missing sequence only surfaces later as an insert failure in the D365 client.
+                long createSeq = maxRecId + SEQUENCE_GAP;
+                string createSeqQuery = $"CREATE SEQUENCE [{sequenceName}] AS BIGINT START WITH {createSeq} INCREMENT BY 1 MINVALUE 1 NO CACHE";
+                _logger($"[AxDB] {tableInfo.TableName}: Sequence {sequenceName} not found in sys.sequences (AxDbTableId={tableInfo.AxDbTableId}) — creating it");
+                _logger($"[AxDB SQL] {createSeqQuery}");
+
+                using var createCommand = new SqlCommand(createSeqQuery, connection, transaction);
+                createCommand.CommandTimeout = _connectionSettings.CommandTimeout;
+                await createCommand.ExecuteNonQueryAsync(cancellationToken);
                 return;
             }
 

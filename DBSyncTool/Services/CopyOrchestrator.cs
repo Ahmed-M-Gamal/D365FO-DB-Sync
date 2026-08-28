@@ -115,6 +115,10 @@ namespace DBSyncTool.Services
                 int skipped = 0;
                 int processed = 0;
 
+                // ========== PASS 1: filter + resolve caches for qualifying tables ==========
+                var qualifyingTables = new List<(string TableName, long RowCount, decimal SizeGB, long BytesPerRow,
+                    int Tier2TableId, int AxDbTableId, List<string> Tier2Fields, List<string> AxDbFields, StrategyOverride Strategy)>();
+
                 foreach (var (tableName, rowCount, sizeGB, bytesPerRow) in discoveredTables)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -186,6 +190,28 @@ namespace DBSyncTool.Services
                     var axDbFields = axDbCache.GetFields(axDbTableId.Value) ?? new List<string>();
                     // ===========================================================
 
+                    qualifyingTables.Add((tableName, rowCount, sizeGB, bytesPerRow, tier2TableId.Value, axDbTableId.Value, tier2Fields, axDbFields, strategy));
+                }
+
+                // ========== SYNC UAT SCHEMA: add columns present in Tier2 but missing in AxDB ==========
+                Dictionary<string, List<string>> addedColumnsByTable = new(StringComparer.OrdinalIgnoreCase);
+                if (_config.SyncUatSchema && qualifyingTables.Count > 0)
+                {
+                    var tier2FieldsByTable = qualifyingTables.ToDictionary(q => q.TableName.ToUpperInvariant(), q => q.Tier2Fields, StringComparer.OrdinalIgnoreCase);
+                    var axDbFieldsByTable = qualifyingTables.ToDictionary(q => q.TableName.ToUpperInvariant(), q => q.AxDbFields, StringComparer.OrdinalIgnoreCase);
+                    addedColumnsByTable = await SyncMissingColumnsAsync(tier2FieldsByTable, axDbFieldsByTable, cancellationToken);
+                }
+                // ==========================================================================
+
+                // ========== PASS 2: build TableInfo for each qualifying table ==========
+                foreach (var (tableName, rowCount, sizeGB, bytesPerRow, tier2TableId, axDbTableId, tier2Fields, axDbFieldsRaw, strategy) in qualifyingTables)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var axDbFields = addedColumnsByTable.TryGetValue(tableName.ToUpperInvariant(), out var addedCols)
+                        ? axDbFieldsRaw.Concat(addedCols).ToList()
+                        : axDbFieldsRaw;
+
                     // Calculate copyable fields (intersection minus excluded)
                     var copyableFields = tier2Fields.Intersect(axDbFields, StringComparer.OrdinalIgnoreCase).ToList();
                     var tableExcludedFields = excludedFields.ContainsKey(tableName.ToUpper())
@@ -237,8 +263,8 @@ namespace DBSyncTool.Services
                     var tableInfo = new TableInfo
                     {
                         TableName = tableName,
-                        TableId = tier2TableId.Value,
-                        AxDbTableId = axDbTableId.Value,
+                        TableId = tier2TableId,
+                        AxDbTableId = axDbTableId,
                         StrategyType = strategy.StrategyType,
                         RecIdCount = strategy.RecIdCount,
                         SqlTemplate = strategy.SqlTemplate,
@@ -296,6 +322,13 @@ namespace DBSyncTool.Services
                         var tier2ColsMap = await _tier2Service.GetTablesColumnsAsync(systemCandidates);
                         var axDbColsMap = await _axDbService.GetTablesColumnsAsync(systemCandidates);
 
+                        if (_config.SyncUatSchema)
+                        {
+                            var addedSysColumns = await SyncMissingColumnsAsync(tier2ColsMap, axDbColsMap, cancellationToken);
+                            if (addedSysColumns.Count > 0)
+                                axDbColsMap = await _axDbService.GetTablesColumnsAsync(systemCandidates);
+                        }
+
                         foreach (var tableName in systemCandidates)
                         {
                             cancellationToken.ThrowIfCancellationRequested();
@@ -333,6 +366,75 @@ namespace DBSyncTool.Services
                 OnStatusUpdated($"Error: {ex.Message}");
                 throw;
             }
+        }
+
+        /// <summary>
+        /// Sync UAT Schema: adds any column present in Tier2 but missing in AxDB (matching
+        /// Tier2's SQL type, always nullable), so the intersection-based field comparison picks
+        /// it up instead of silently dropping it. Physical-only — does not touch AxDB's
+        /// SQLDICTIONARY, so D365/X++ will not recognize the field until the model is updated
+        /// and a real Database Sync is run. Used for both normal and System tables. Returns the
+        /// column names actually added, keyed by upper table name, for the caller to fold back
+        /// into its own field lists.
+        /// </summary>
+        private async Task<Dictionary<string, List<string>>> SyncMissingColumnsAsync(
+            Dictionary<string, List<string>> tier2FieldsByTable,
+            Dictionary<string, List<string>> axDbFieldsByTable,
+            CancellationToken cancellationToken)
+        {
+            var added = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+            var missingByTable = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (table, tier2Fields) in tier2FieldsByTable)
+            {
+                if (!axDbFieldsByTable.TryGetValue(table, out var axDbFields))
+                    continue; // table doesn't exist in AxDB at all — out of scope here, existing error path handles it
+
+                var missing = tier2Fields.Except(axDbFields, StringComparer.OrdinalIgnoreCase).ToList();
+                if (missing.Count > 0)
+                    missingByTable[table] = missing;
+            }
+
+            if (missingByTable.Count == 0)
+                return added;
+
+            _logger("─────────────────────────────────────────────");
+            _logger($"[SchemaSync] Found {missingByTable.Sum(m => m.Value.Count)} missing column(s) across {missingByTable.Count} table(s) — fetching definitions from Tier2...");
+
+            var colDefsByTable = await _tier2Service.GetColumnDefinitionsAsync(missingByTable.Keys);
+
+            foreach (var (table, missingCols) in missingByTable)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (!colDefsByTable.TryGetValue(table, out var allDefs))
+                    continue;
+
+                var defsToAdd = allDefs.Where(d => missingCols.Contains(d.ColumnName, StringComparer.OrdinalIgnoreCase)).ToList();
+                if (defsToAdd.Count == 0)
+                    continue;
+
+                try
+                {
+                    int count = await _axDbService.AddMissingColumnsAsync(table, defsToAdd, cancellationToken);
+                    if (count > 0)
+                    {
+                        added[table] = defsToAdd.Select(d => d.ColumnName).ToList();
+                        foreach (var d in defsToAdd)
+                            _logger($"[SchemaSync] {table}: added column [{d.ColumnName}] {d.SqlTypeString} NULL");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger($"[SchemaSync] {table}: FAILED to add missing column(s) — {ex.Message}");
+                }
+            }
+
+            int addedCount = added.Sum(a => a.Value.Count);
+            _logger($"[SchemaSync] Added {addedCount} column(s) across {added.Count} table(s). Note: physical column only — AxDB's SQLDICTIONARY was not updated, so D365/X++ will not recognize the field until the model is updated and a real Database Sync is run.");
+            _logger("─────────────────────────────────────────────");
+
+            return added;
         }
 
         /// <summary>
@@ -1261,7 +1363,16 @@ namespace DBSyncTool.Services
 
             if (currentSeqResult == null || currentSeqResult == DBNull.Value)
             {
-                _logger($"[AxDB] {table.TableName}: Sequence {sequenceName} not found in sys.sequences (AxDbTableId={table.AxDbTableId}), skipping sequence update");
+                // Sequence missing entirely (e.g. Database Sync never ran/completed for this table
+                // locally) — create it rather than silently leaving the table without one, since a
+                // missing sequence only surfaces later as an insert failure in the D365 client.
+                long createSeq = maxRecId + AxDbDataService.SEQUENCE_GAP;
+                string createSeqSql = $"CREATE SEQUENCE [{sequenceName}] AS BIGINT START WITH {createSeq} INCREMENT BY 1 MINVALUE 1 NO CACHE";
+                _logger($"[AxDB] {table.TableName}: Sequence {sequenceName} not found in sys.sequences (AxDbTableId={table.AxDbTableId}) — creating it");
+                _logger($"[AxDB SQL] {createSeqSql}");
+
+                using var createCmd = new SqlCommand(createSeqSql, connection, transaction);
+                await createCmd.ExecuteNonQueryAsync(cancellationToken);
                 return;
             }
 

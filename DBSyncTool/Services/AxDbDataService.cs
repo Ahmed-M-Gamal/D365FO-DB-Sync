@@ -531,6 +531,15 @@ namespace DBSyncTool.Services
         /// </summary>
         private async Task UpdateSequenceAsync(TableInfo tableInfo, SqlConnection connection, SqlTransaction? transaction, CancellationToken cancellationToken)
         {
+            // AxDbTableId = 0 means the table isn't registered in AxDB's SQLDICTIONARY (it was
+            // only discovered via its physical columns) — SEQ_{TableId} naming has no reliable
+            // TableId to use without that row, so sequence management is skipped for it.
+            if (tableInfo.AxDbTableId == 0)
+            {
+                _logger($"[AxDB] {tableInfo.TableName}: not registered in AxDB SQLDICTIONARY — sequence not managed (run a Database Sync locally to register this table properly)");
+                return;
+            }
+
             // Get max RecId from the table
             string maxRecIdQuery = $"SELECT MAX(RecId) FROM [{tableInfo.TableName}]";
             using var command1 = new SqlCommand(maxRecIdQuery, connection, transaction);

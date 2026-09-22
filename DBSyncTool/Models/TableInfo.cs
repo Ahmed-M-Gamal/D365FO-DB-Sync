@@ -7,7 +7,7 @@ namespace DBSyncTool.Models
         // Identification
         public string TableName { get; set; } = string.Empty;
         public int TableId { get; set; }        // Tier2 SQLDICTIONARY TableId
-        public int AxDbTableId { get; set; }    // AxDB SQLDICTIONARY TableId (used for sequence updates)
+        public int AxDbTableId { get; set; }    // AxDB SQLDICTIONARY TableId (used for sequence updates). 0 = table has no local SQLDICTIONARY row (found via physical columns instead) — sequence management is skipped
 
         // Strategy
         public CopyStrategyType StrategyType { get; set; }

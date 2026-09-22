@@ -115,9 +115,25 @@ namespace DBSyncTool.Services
                 int skipped = 0;
                 int processed = 0;
 
+                // Skip-reason breakdown, logged as a summary at the end so a large "skipped"
+                // total can actually be diagnosed instead of just showing one opaque number.
+                int skippedExcluded = 0;
+                int skippedZeroRows = 0;
+                int skippedNotInTier2Dict = 0;
+                int skippedNotInAxDbDict = 0;
+                int skippedNoCopyableFields = 0;
+                int foundViaPhysicalFallback = 0;
+
                 // ========== PASS 1: filter + resolve caches for qualifying tables ==========
                 var qualifyingTables = new List<(string TableName, long RowCount, decimal SizeGB, long BytesPerRow,
                     int Tier2TableId, int AxDbTableId, List<string> Tier2Fields, List<string> AxDbFields, StrategyOverride Strategy)>();
+
+                // Tables found in Tier2 but not registered in AxDB's SQLDICTIONARY — may still
+                // exist physically (the same local metadata-vs-physical-schema gap already seen
+                // with missing sequences). Resolved via one batched physical-column check after
+                // this loop instead of failing them outright.
+                var pendingPhysicalCheck = new List<(string TableName, long RowCount, decimal SizeGB, long BytesPerRow,
+                    int Tier2TableId, List<string> Tier2Fields, StrategyOverride Strategy)>();
 
                 foreach (var (tableName, rowCount, sizeGB, bytesPerRow) in discoveredTables)
                 {
@@ -149,6 +165,7 @@ namespace DBSyncTool.Services
                             }
                         }
                         skipped++;
+                        skippedExcluded++;
                         continue;
                     }
 
@@ -158,6 +175,7 @@ namespace DBSyncTool.Services
                         if (axdbNonEmptyTables == null || !axdbNonEmptyTables.Contains(tableName))
                         {
                             skipped++;
+                            skippedZeroRows++;
                             continue;
                         }
                         _logger($"[Truncate] {tableName}: 0 rows in Tier2, has rows in AxDB — will truncate");
@@ -170,27 +188,54 @@ namespace DBSyncTool.Services
                     {
                         _logger($"Table {tableName} not found in Tier2 SQLDICTIONARY, skipping");
                         skipped++;
-                        continue;
-                    }
-
-                    // Get TableID from AxDB cache (no database query!)
-                    var axDbTableId = axDbCache.GetTableId(tableName);
-                    if (axDbTableId == null)
-                    {
-                        _logger($"Table {tableName} not found in AxDB SQLDICTIONARY, skipping");
-                        skipped++;
+                        skippedNotInTier2Dict++;
                         continue;
                     }
 
                     // Determine copy strategy
                     var strategy = GetStrategy(tableName, strategyOverrides);
-
-                    // Get fields from caches (no database queries!)
                     var tier2Fields = tier2Cache.GetFields(tier2TableId.Value) ?? new List<string>();
+
+                    // Get TableID from AxDB cache (no database query!). Not found here doesn't
+                    // necessarily mean the table is missing locally — defer to the batched
+                    // physical-existence check below rather than skipping immediately.
+                    var axDbTableId = axDbCache.GetTableId(tableName);
+                    if (axDbTableId == null)
+                    {
+                        pendingPhysicalCheck.Add((tableName, rowCount, sizeGB, bytesPerRow, tier2TableId.Value, tier2Fields, strategy));
+                        continue;
+                    }
+
+                    // Get fields from cache (no database query!)
                     var axDbFields = axDbCache.GetFields(axDbTableId.Value) ?? new List<string>();
                     // ===========================================================
 
                     qualifyingTables.Add((tableName, rowCount, sizeGB, bytesPerRow, tier2TableId.Value, axDbTableId.Value, tier2Fields, axDbFields, strategy));
+                }
+
+                // ========== FALLBACK: not in AxDB SQLDICTIONARY — check physical existence ==========
+                // AxDbTableId = 0 below is a sentinel meaning "no local SQLDICTIONARY row" —
+                // UpdateSequenceAsync skips sequence management for these (see its guard clause),
+                // since SEQ_{TableId} naming has no reliable TableId to use without that row.
+                if (pendingPhysicalCheck.Count > 0)
+                {
+                    var physicalCols = await _axDbService.GetTablesColumnsAsync(pendingPhysicalCheck.Select(p => p.TableName));
+                    foreach (var pending in pendingPhysicalCheck)
+                    {
+                        if (physicalCols.TryGetValue(pending.TableName, out var axDbFields) && axDbFields.Count > 0)
+                        {
+                            _logger($"[AxDB] {pending.TableName}: not registered in AxDB SQLDICTIONARY, but exists physically — using its actual columns. RecId sequence will not be auto-managed until a Database Sync registers this table locally.");
+                            foundViaPhysicalFallback++;
+                            qualifyingTables.Add((pending.TableName, pending.RowCount, pending.SizeGB, pending.BytesPerRow,
+                                pending.Tier2TableId, 0, pending.Tier2Fields, axDbFields, pending.Strategy));
+                        }
+                        else
+                        {
+                            _logger($"Table {pending.TableName} not found in AxDB SQLDICTIONARY or as a physical table, skipping");
+                            skipped++;
+                            skippedNotInAxDbDict++;
+                        }
+                    }
                 }
 
                 // ========== SYNC UAT SCHEMA: add columns present in Tier2 but missing in AxDB ==========
@@ -230,6 +275,7 @@ namespace DBSyncTool.Services
                     {
                         _logger($"Table {tableName} has no copyable fields, skipping");
                         skipped++;
+                        skippedNoCopyableFields++;
                         continue;
                     }
 
@@ -352,6 +398,16 @@ namespace DBSyncTool.Services
                 decimal totalEstimatedMB = _tables.Sum(t => t.EstimatedSizeMB);
 
                 _logger($"Prepared {processed} tables, {skipped} skipped, {totalEstimatedMB:F2} MB to copy");
+                if (foundViaPhysicalFallback > 0)
+                {
+                    _logger($"{foundViaPhysicalFallback} table(s) recovered via physical-column fallback (no AxDB SQLDICTIONARY row, but the table exists locally) — sequence not auto-managed for these until a Database Sync registers them");
+                }
+                if (skipped > 0)
+                {
+                    _logger($"Skip breakdown: {skippedExcluded} excluded by pattern, {skippedZeroRows} zero rows in Tier2, " +
+                            $"{skippedNotInTier2Dict} not in Tier2 SQLDICTIONARY, {skippedNotInAxDbDict} not in AxDB SQLDICTIONARY or physically (table doesn't exist locally), " +
+                            $"{skippedNoCopyableFields} no common/copyable fields");
+                }
                 OnStatusUpdated($"Prepared {processed} tables, {skipped} skipped, {totalEstimatedMB:F2} MB to copy");
                 OnTablesUpdated();
             }
@@ -398,6 +454,35 @@ namespace DBSyncTool.Services
             if (missingByTable.Count == 0)
                 return added;
 
+            // The field lists diffed above come from SQLDICTIONARY for normal tables, which this
+            // tool never writes to — so a column a previous Sync UAT Schema run already added
+            // physically still looks "missing" here on every later run. Check AxDB's actual
+            // columns first and fold anything already physically present straight into `added`
+            // instead of attempting to ALTER TABLE ADD it again (which fails: column already exists).
+            var axDbPhysicalCols = await _axDbService.GetTablesColumnsAsync(missingByTable.Keys);
+            foreach (var table in missingByTable.Keys.ToList())
+            {
+                if (!axDbPhysicalCols.TryGetValue(table, out var physicalCols))
+                    continue;
+
+                var alreadyPhysical = missingByTable[table]
+                    .Where(c => physicalCols.Contains(c, StringComparer.OrdinalIgnoreCase))
+                    .ToList();
+                if (alreadyPhysical.Count == 0)
+                    continue;
+
+                added[table] = alreadyPhysical;
+
+                var stillMissing = missingByTable[table].Except(alreadyPhysical, StringComparer.OrdinalIgnoreCase).ToList();
+                if (stillMissing.Count == 0)
+                    missingByTable.Remove(table);
+                else
+                    missingByTable[table] = stillMissing;
+            }
+
+            if (missingByTable.Count == 0)
+                return added;
+
             _logger("─────────────────────────────────────────────");
             _logger($"[SchemaSync] Found {missingByTable.Sum(m => m.Value.Count)} missing column(s) across {missingByTable.Count} table(s) — fetching definitions from Tier2...");
 
@@ -419,7 +504,11 @@ namespace DBSyncTool.Services
                     int count = await _axDbService.AddMissingColumnsAsync(table, defsToAdd, cancellationToken);
                     if (count > 0)
                     {
-                        added[table] = defsToAdd.Select(d => d.ColumnName).ToList();
+                        if (added.TryGetValue(table, out var alreadyAdded))
+                            alreadyAdded.AddRange(defsToAdd.Select(d => d.ColumnName));
+                        else
+                            added[table] = defsToAdd.Select(d => d.ColumnName).ToList();
+
                         foreach (var d in defsToAdd)
                             _logger($"[SchemaSync] {table}: added column [{d.ColumnName}] {d.SqlTypeString} NULL");
                     }
@@ -431,7 +520,7 @@ namespace DBSyncTool.Services
             }
 
             int addedCount = added.Sum(a => a.Value.Count);
-            _logger($"[SchemaSync] Added {addedCount} column(s) across {added.Count} table(s). Note: physical column only — AxDB's SQLDICTIONARY was not updated, so D365/X++ will not recognize the field until the model is updated and a real Database Sync is run.");
+            _logger($"[SchemaSync] {addedCount} column(s) now available across {added.Count} table(s) (created this run, or already physically present from a previous run). Note: physical column only — AxDB's SQLDICTIONARY was not updated, so D365/X++ will not recognize the field until the model is updated and a real Database Sync is run.");
             _logger("─────────────────────────────────────────────");
 
             return added;
@@ -517,7 +606,6 @@ namespace DBSyncTool.Services
         {
             _cancellationTokenSource = new CancellationTokenSource();
             var cancellationToken = _cancellationTokenSource.Token;
-            var cts = _cancellationTokenSource;  // capture for auto-stop on failure
 
             try
             {
@@ -561,16 +649,6 @@ namespace DBSyncTool.Services
                         else
                         {
                             Interlocked.Increment(ref failed);
-
-                            // Auto-stop: cancel the entire run on the first table failure so
-                            // workers stop pulling new tables instead of churning through the
-                            // remaining queue (e.g. when the AxDB transaction log is full).
-                            // Remaining queued tables stay Pending; failed ones can be retried.
-                            if (!cancellationToken.IsCancellationRequested)
-                            {
-                                _logger($"Auto-stopping run: {table.TableName} failed ({table.Status}: {table.Error}). Cancelling remaining tables.");
-                                cts.Cancel();
-                            }
                         }
 
                         // Calculate progress using pre-computed values (O(1) instead of O(n))
@@ -605,6 +683,7 @@ namespace DBSyncTool.Services
                 var alias = _config.Alias;
 
                 _logger($"Processed {completed} tables successfully, {failed} failed | Records: {totalRecordsToCopy:N0} | Workers: {workers} | Alias: {alias} | Total time: {totalTime}");
+                LogFailedTablesReport(pendingTables);
                 OnStatusUpdated($"Processed {completed} tables, {failed} failed | Time: {totalTime}");
             }
             catch (OperationCanceledException)
@@ -628,7 +707,6 @@ namespace DBSyncTool.Services
         {
             _cancellationTokenSource = new CancellationTokenSource();
             var cancellationToken = _cancellationTokenSource.Token;
-            var cts = _cancellationTokenSource;  // capture for auto-stop on failure
 
             try
             {
@@ -688,13 +766,6 @@ namespace DBSyncTool.Services
                         else
                         {
                             Interlocked.Increment(ref failed);
-
-                            // Auto-stop the retry run on the first failure (e.g. log still full)
-                            if (!cancellationToken.IsCancellationRequested)
-                            {
-                                _logger($"Auto-stopping retry: {table.TableName} failed ({table.Status}: {table.Error}). Cancelling remaining tables.");
-                                cts.Cancel();
-                            }
                         }
 
                         OnStatusUpdated($"Retry Failed - {completed + failed}/{totalCount} tables");
@@ -705,6 +776,7 @@ namespace DBSyncTool.Services
                 await Task.WhenAll(workerTasks);
 
                 _logger($"Retry completed: {completed} succeeded, {failed} failed");
+                LogFailedTablesReport(failedTables);
                 OnStatusUpdated($"Retry: {completed} succeeded, {failed} failed");
             }
             catch (OperationCanceledException)
@@ -718,6 +790,26 @@ namespace DBSyncTool.Services
                 OnStatusUpdated($"Error: {ex.Message}");
                 throw;
             }
+        }
+
+        /// <summary>
+        /// Logs a clear, itemized list of every table left in FetchError/InsertError after a
+        /// Process Tables / Retry Failed run, so failures are never just a count buried in a
+        /// summary line — each table processed in this run keeps its own final status regardless
+        /// of what happened to any other table (no run-wide auto-stop on a single failure).
+        /// </summary>
+        private void LogFailedTablesReport(IEnumerable<TableInfo> processedTables)
+        {
+            var failedTables = processedTables
+                .Where(t => t.Status == TableStatus.FetchError || t.Status == TableStatus.InsertError)
+                .ToList();
+
+            if (failedTables.Count == 0)
+                return;
+
+            _logger($"Failed tables ({failedTables.Count}):");
+            foreach (var table in failedTables)
+                _logger($"  - {table.TableName} [{table.Status}]: {table.Error}");
         }
 
         /// <summary>
@@ -1343,6 +1435,15 @@ namespace DBSyncTool.Services
 
         private async Task UpdateSequenceAsync(TableInfo table, SqlConnection connection, SqlTransaction? transaction, CancellationToken cancellationToken)
         {
+            // AxDbTableId = 0 means the table isn't registered in AxDB's SQLDICTIONARY (it was
+            // only discovered via its physical columns) — SEQ_{TableId} naming has no reliable
+            // TableId to use without that row, so sequence management is skipped for it.
+            if (table.AxDbTableId == 0)
+            {
+                _logger($"[AxDB] {table.TableName}: not registered in AxDB SQLDICTIONARY — sequence not managed (run a Database Sync locally to register this table properly)");
+                return;
+            }
+
             string maxRecIdSql = $"SELECT MAX(RecId) FROM [{table.TableName}]";
             using var cmd1 = new SqlCommand(maxRecIdSql, connection, transaction);
             var maxRecIdResult = await cmd1.ExecuteScalarAsync(cancellationToken);

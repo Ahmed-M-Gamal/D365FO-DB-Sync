@@ -98,7 +98,9 @@ namespace DBSyncTool.Helpers
                 sql.AppendLine($"-- Saved Tier2 timestamp: {(table.StoredTier2Timestamp != null ? TimestampHelper.ToHexString(table.StoredTier2Timestamp) + savedNote : "(none)")}");
                 sql.AppendLine($"-- Saved AxDB timestamp:  {(table.StoredAxDBTimestamp != null ? TimestampHelper.ToHexString(table.StoredAxDBTimestamp) + savedNote : "(none)")}");
                 sql.AppendLine($"-- Saved MaxRecId:        {(table.StoredMaxRecId.HasValue ? table.StoredMaxRecId.Value.ToString("N0") : "(none)")}");
-                sql.AppendLine($"-- AxDB TableId: {table.AxDbTableId}   Sequence: SEQ_{table.AxDbTableId}");
+                sql.AppendLine(table.AxDbTableId == 0
+                    ? "-- AxDB TableId: (not registered in AxDB SQLDICTIONARY — discovered via physical columns; no sequence managed)"
+                    : $"-- AxDB TableId: {table.AxDbTableId}   Sequence: SEQ_{table.AxDbTableId}");
             }
 
             sql.AppendLine("-- ==========================================================================");
@@ -138,6 +140,14 @@ namespace DBSyncTool.Helpers
         private static void AppendSequenceUpdate(System.Text.StringBuilder sql, TableInfo table, string stepTitle)
         {
             sql.AppendLine(stepTitle);
+
+            if (table.AxDbTableId == 0)
+            {
+                sql.AppendLine("-- Table not registered in AxDB SQLDICTIONARY (discovered via its physical columns) —");
+                sql.AppendLine("-- sequence not managed. Run a Database Sync locally to register this table properly.");
+                return;
+            }
+
             sql.AppendLine($"SELECT MAX(RecId) FROM [{table.TableName}]   -- @MaxRecId; NULL (empty table) → nothing below runs");
             sql.AppendLine($"SELECT CAST(current_value AS BIGINT) FROM sys.sequences WHERE name = 'SEQ_{table.AxDbTableId}'");
             sql.AppendLine("-- @CurrentSeq; sequence not found (Database Sync never created it) →");

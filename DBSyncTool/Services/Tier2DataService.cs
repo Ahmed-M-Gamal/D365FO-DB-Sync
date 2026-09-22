@@ -110,37 +110,41 @@ namespace DBSyncTool.Services
                 return result;
 
             using var connection = new SqlConnection(_connectionString);
-            using var command = new SqlCommand(string.Empty, connection);
-            string inClause = BuildInClause(command, names);
-
-            command.CommandText = $@"
-                SELECT
-                    o.name AS TableName,
-                    MAX(s.row_count) AS [RowCount],
-                    SUM(s.reserved_page_count) * 8.0 / (1024 * 1024) AS [SizeGB],
-                    CASE
-                        WHEN MAX(s.row_count) > 0
-                        THEN (8 * 1024 * SUM(s.reserved_page_count)) / MAX(s.row_count)
-                        ELSE 0
-                    END AS [BytesPerRow]
-                FROM sys.dm_db_partition_stats s
-                INNER JOIN sys.objects o ON o.object_id = s.object_id
-                WHERE o.type = 'U'
-                  AND SCHEMA_NAME(o.schema_id) = 'dbo'
-                  AND UPPER(o.name) IN ({inClause})
-                GROUP BY o.name";
-            command.CommandTimeout = _connectionSettings.CommandTimeout;
-
             await connection.OpenAsync();
-            using var reader = await command.ExecuteReaderAsync();
 
-            while (await reader.ReadAsync())
+            foreach (var chunk in ChunkNames(names))
             {
-                string name = reader.GetString(0).ToUpper();
-                long rowCount = reader.GetInt64(1);
-                decimal sizeGB = reader.GetDecimal(2);
-                long bytesPerRow = reader.GetInt64(3);
-                result[name] = (rowCount, sizeGB, bytesPerRow);
+                using var command = new SqlCommand(string.Empty, connection);
+                string inClause = BuildInClause(command, chunk);
+
+                command.CommandText = $@"
+                    SELECT
+                        o.name AS TableName,
+                        MAX(s.row_count) AS [RowCount],
+                        SUM(s.reserved_page_count) * 8.0 / (1024 * 1024) AS [SizeGB],
+                        CASE
+                            WHEN MAX(s.row_count) > 0
+                            THEN (8 * 1024 * SUM(s.reserved_page_count)) / MAX(s.row_count)
+                            ELSE 0
+                        END AS [BytesPerRow]
+                    FROM sys.dm_db_partition_stats s
+                    INNER JOIN sys.objects o ON o.object_id = s.object_id
+                    WHERE o.type = 'U'
+                      AND SCHEMA_NAME(o.schema_id) = 'dbo'
+                      AND UPPER(o.name) IN ({inClause})
+                    GROUP BY o.name";
+                command.CommandTimeout = _connectionSettings.CommandTimeout;
+
+                using var reader = await command.ExecuteReaderAsync();
+
+                while (await reader.ReadAsync())
+                {
+                    string name = reader.GetString(0).ToUpper();
+                    long rowCount = reader.GetInt64(1);
+                    decimal sizeGB = reader.GetDecimal(2);
+                    long bytesPerRow = reader.GetInt64(3);
+                    result[name] = (rowCount, sizeGB, bytesPerRow);
+                }
             }
 
             return result;
@@ -169,34 +173,38 @@ namespace DBSyncTool.Services
                 return result;
 
             using var connection = new SqlConnection(connectionString);
-            using var command = new SqlCommand(string.Empty, connection);
-            string inClause = BuildInClause(command, names);
-
-            command.CommandText = $@"
-                SELECT c.TABLE_NAME, c.COLUMN_NAME
-                FROM INFORMATION_SCHEMA.COLUMNS c
-                INNER JOIN INFORMATION_SCHEMA.TABLES t
-                    ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
-                   AND t.TABLE_NAME = c.TABLE_NAME
-                WHERE c.TABLE_SCHEMA = 'dbo'
-                  AND t.TABLE_TYPE = 'BASE TABLE'
-                  AND UPPER(c.TABLE_NAME) IN ({inClause})
-                ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION";
-            command.CommandTimeout = commandTimeout;
-
             await connection.OpenAsync();
-            using var reader = await command.ExecuteReaderAsync();
 
-            while (await reader.ReadAsync())
+            foreach (var chunk in ChunkNames(names))
             {
-                string table = reader.GetString(0).ToUpper();
-                string column = reader.GetString(1);
-                if (!result.TryGetValue(table, out var list))
+                using var command = new SqlCommand(string.Empty, connection);
+                string inClause = BuildInClause(command, chunk);
+
+                command.CommandText = $@"
+                    SELECT c.TABLE_NAME, c.COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS c
+                    INNER JOIN INFORMATION_SCHEMA.TABLES t
+                        ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
+                       AND t.TABLE_NAME = c.TABLE_NAME
+                    WHERE c.TABLE_SCHEMA = 'dbo'
+                      AND t.TABLE_TYPE = 'BASE TABLE'
+                      AND UPPER(c.TABLE_NAME) IN ({inClause})
+                    ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION";
+                command.CommandTimeout = commandTimeout;
+
+                using var reader = await command.ExecuteReaderAsync();
+
+                while (await reader.ReadAsync())
                 {
-                    list = new List<string>();
-                    result[table] = list;
+                    string table = reader.GetString(0).ToUpper();
+                    string column = reader.GetString(1);
+                    if (!result.TryGetValue(table, out var list))
+                    {
+                        list = new List<string>();
+                        result[table] = list;
+                    }
+                    list.Add(column);
                 }
-                list.Add(column);
             }
 
             return result;
@@ -224,48 +232,67 @@ namespace DBSyncTool.Services
                 return result;
 
             using var connection = new SqlConnection(connectionString);
-            using var command = new SqlCommand(string.Empty, connection);
-            string inClause = BuildInClause(command, names);
-
-            command.CommandText = $@"
-                SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, c.CHARACTER_MAXIMUM_LENGTH,
-                       c.NUMERIC_PRECISION, c.NUMERIC_SCALE, c.DATETIME_PRECISION, c.COLLATION_NAME
-                FROM INFORMATION_SCHEMA.COLUMNS c
-                INNER JOIN INFORMATION_SCHEMA.TABLES t
-                    ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
-                   AND t.TABLE_NAME = c.TABLE_NAME
-                WHERE c.TABLE_SCHEMA = 'dbo'
-                  AND t.TABLE_TYPE = 'BASE TABLE'
-                  AND UPPER(c.TABLE_NAME) IN ({inClause})
-                ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION";
-            command.CommandTimeout = commandTimeout;
-
             await connection.OpenAsync();
-            using var reader = await command.ExecuteReaderAsync();
 
-            while (await reader.ReadAsync())
+            foreach (var chunk in ChunkNames(names))
             {
-                string table = reader.GetString(0).ToUpper();
-                var def = new ColumnDefinition
-                {
-                    ColumnName = reader.GetString(1),
-                    DataType = reader.GetString(2),
-                    MaxLength = reader.IsDBNull(3) ? null : reader.GetInt32(3),
-                    Precision = reader.IsDBNull(4) ? null : (int)reader.GetByte(4),
-                    Scale = reader.IsDBNull(5) ? null : (int)reader.GetInt32(5),
-                    DateTimePrecision = reader.IsDBNull(6) ? null : (int)reader.GetInt16(6),
-                    Collation = reader.IsDBNull(7) ? null : reader.GetString(7)
-                };
+                using var command = new SqlCommand(string.Empty, connection);
+                string inClause = BuildInClause(command, chunk);
 
-                if (!result.TryGetValue(table, out var list))
+                command.CommandText = $@"
+                    SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, c.CHARACTER_MAXIMUM_LENGTH,
+                           c.NUMERIC_PRECISION, c.NUMERIC_SCALE, c.DATETIME_PRECISION, c.COLLATION_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS c
+                    INNER JOIN INFORMATION_SCHEMA.TABLES t
+                        ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
+                       AND t.TABLE_NAME = c.TABLE_NAME
+                    WHERE c.TABLE_SCHEMA = 'dbo'
+                      AND t.TABLE_TYPE = 'BASE TABLE'
+                      AND UPPER(c.TABLE_NAME) IN ({inClause})
+                    ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION";
+                command.CommandTimeout = commandTimeout;
+
+                using var reader = await command.ExecuteReaderAsync();
+
+                while (await reader.ReadAsync())
                 {
-                    list = new List<ColumnDefinition>();
-                    result[table] = list;
+                    string table = reader.GetString(0).ToUpper();
+                    var def = new ColumnDefinition
+                    {
+                        ColumnName = reader.GetString(1),
+                        DataType = reader.GetString(2),
+                        MaxLength = reader.IsDBNull(3) ? null : reader.GetInt32(3),
+                        Precision = reader.IsDBNull(4) ? null : (int)reader.GetByte(4),
+                        Scale = reader.IsDBNull(5) ? null : (int)reader.GetInt32(5),
+                        DateTimePrecision = reader.IsDBNull(6) ? null : (int)reader.GetInt16(6),
+                        Collation = reader.IsDBNull(7) ? null : reader.GetString(7)
+                    };
+
+                    if (!result.TryGetValue(table, out var list))
+                    {
+                        list = new List<ColumnDefinition>();
+                        result[table] = list;
+                    }
+                    list.Add(def);
                 }
-                list.Add(def);
             }
 
             return result;
+        }
+
+        // SQL Server rejects a request with more than 2100 parameters; each name in an IN clause
+        // consumes one via BuildInClause, so a table list larger than this must be split across
+        // multiple queries. Kept well under the limit as a safety margin.
+        private const int MaxInClauseParams = 2000;
+
+        /// <summary>
+        /// Splits a table name list into chunks small enough that BuildInClause never exceeds
+        /// SQL Server's 2100-parameter-per-request limit.
+        /// </summary>
+        private static IEnumerable<List<string>> ChunkNames(List<string> names)
+        {
+            for (int i = 0; i < names.Count; i += MaxInClauseParams)
+                yield return names.GetRange(i, Math.Min(MaxInClauseParams, names.Count - i));
         }
 
         /// <summary>
